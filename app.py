@@ -1,101 +1,121 @@
-import streamlit as st
-import pandas as pd
-from deep_translator import GoogleTranslator
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from jiwer import wer
-import matplotlib.pyplot as plt
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
 import os
+import pandas as pd
+import torch
+import streamlit as st
+from transformers import pipeline
+import evaluate
+from jiwer import wer
+import numpy as np
+import matplotlib.pyplot as plt
+from fpdf import FPDF
 
-# ---- CONFIG ----
-st.set_page_config(page_title="JP→EN Translation Evaluation", layout="wide")
+# ----------------------------
+# Streamlit UI
+# ----------------------------
+st.set_page_config(page_title="Japanese → English Translation Evaluator", layout="wide")
+st.title("🎧 Translation Evaluation App")
+st.write("Upload your **validated.tsv** file (from CV corpus) and evaluate translations (Japanese → English).")
 
-# ---- LOAD DATA ----
-st.title("Japanese → English Translation & Evaluation Report")
+# File uploader
+uploaded_file = st.file_uploader("Upload validated.tsv", type=["tsv"])
 
-csv_file = "matched_dataset.csv"
-if not os.path.exists(csv_file):
-    st.error(f"{csv_file} not found!")
-    st.stop()
+if uploaded_file:
+    # Load dataset
+    tsv_df = pd.read_csv(uploaded_file, sep="\t")
+    st.success(f"Loaded {len(tsv_df)} rows from dataset.")
 
-df = pd.read_csv(csv_file)
+    # Translator pipeline
+    st.info("Loading translation model... (first time may take longer)")
+    translator = pipeline("translation", model="staka/fugumt-ja-en", device=0 if torch.cuda.is_available() else -1)
 
-if 'sentence' not in df.columns:
-    st.error("No 'sentence' column found in dataset.")
-    st.stop()
+    # Metrics
+    bleu_metric = evaluate.load("bleu")
 
-st.write(f"Loaded {len(df)} rows from dataset.")
+    def compute_latency_metrics(pred_tokens, ref_tokens):
+        matches = sum(1 for r, h in zip(ref_tokens, pred_tokens) if r == h)
+        la = matches / max(len(ref_tokens), 1)
 
-# ---- TRANSLATION ----
-st.subheader("Translating Japanese → English...")
-translator = GoogleTranslator(source="ja", target="en")
+        delays = []
+        for idx, token in enumerate(ref_tokens):
+            if token in pred_tokens:
+                predicted_idx = pred_tokens.index(token)
+                delays.append(abs(predicted_idx - idx))
+        atd = sum(delays) / max(len(delays), 1)
+        return la, atd
 
-df['predicted_translation'] = df['sentence'].apply(lambda x: translator.translate(x))
+    # Process translations
+    metrics_list = []
+    progress = st.progress(0)
+    for idx, row in tsv_df.iterrows():
+        reference_text = row['sentence']
+        result = translator(reference_text)
+        translated_text = result[0]['translation_text']
 
-# ---- METRICS ----
-st.subheader("Calculating Metrics...")
+        bleu_score = bleu_metric.compute(predictions=[translated_text], references=[[reference_text]])["bleu"]
+        wer_score = wer(reference_text, translated_text)
+        ref_tokens = reference_text.split()
+        pred_tokens = translated_text.split()
+        la_score, atd_score = compute_latency_metrics(pred_tokens, ref_tokens)
 
-bleu_scores, wers, la_scores, atd_scores = [], [], [], []
+        metrics_list.append({
+            "File": row['path'],
+            "Reference": reference_text,
+            "Prediction": translated_text,
+            "BLEU": bleu_score,
+            "WER": wer_score,
+            "LA": la_score,
+            "ATD": atd_score
+        })
+        progress.progress((idx + 1) / len(tsv_df))
 
-for _, row in df.iterrows():
-    ref = row.get("reference", "") or ""  # assumed column for reference English
-    hyp = row['predicted_translation']
+    metrics_df = pd.DataFrame(metrics_list)
 
-    # BLEU
-    smoothie = SmoothingFunction().method4
-    bleu = sentence_bleu([ref.split()], hyp.split(), smoothing_function=smoothie) if ref else None
+    st.subheader("📊 Translation Metrics")
+    st.dataframe(metrics_df)
 
-    # WER
-    w = wer(ref, hyp) if ref else None
+    # Graphs
+    st.subheader("📈 Final Metrics Overview")
+    final_metrics = metrics_df[["BLEU", "WER", "LA", "ATD"]].mean()
+    fig, ax = plt.subplots(figsize=(6, 4))
+    bars_final = ax.bar(final_metrics.index, final_metrics.values, color=["skyblue","salmon","lightgreen","orange"], edgecolor='black')
+    for bar in bars_final:
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2.0, height + 0.05, f'{height:.2f}', ha='center', va='bottom', fontsize=8)
+    ax.set_ylabel("Score")
+    ax.set_title("Final Average Metrics")
+    ax.grid(axis='y', linestyle='--', alpha=0.7)
+    st.pyplot(fig)
 
-    # Dummy LA & ATD (since no live token-by-token times)
-    la = sum(1 for a, b in zip(ref.split(), hyp.split()) if a == b) / max(len(ref.split()), 1) if ref else None
-    atd = abs(len(hyp.split()) - len(ref.split())) if ref else None
+    # PDF Report
+    st.subheader("📑 Generate Report")
+    if st.button("Generate PDF Report"):
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+        pdf.set_font("Arial", 'B', 16)
+        pdf.cell(0, 10, "Translation Evaluation Report", ln=True, align="C")
+        pdf.ln(10)
 
-    bleu_scores.append(bleu)
-    wers.append(w)
-    la_scores.append(la)
-    atd_scores.append(atd)
+        pdf.set_font("Arial", '', 12)
+        pdf.multi_cell(0, 8, "This report summarizes BLEU, WER, LA, and ATD metrics "
+                              "for the uploaded dataset.\n\n"
+                              "Conclusions:\n"
+                              "- Higher BLEU = better translations.\n"
+                              "- Lower WER = fewer errors.\n"
+                              "- LA & ATD provide insights into alignment & latency.\n")
 
-df['BLEU'] = bleu_scores
-df['WER'] = wers
-df['LA'] = la_scores
-df['ATD'] = atd_scores
+        # Final averages
+        pdf.set_font("Arial", 'B', 12)
+        pdf.cell(0, 10, "Final Average Metrics:", ln=True)
+        pdf.set_font("Arial", '', 12)
+        pdf.multi_cell(0, 8,
+            f"BLEU: {final_metrics['BLEU']:.4f}\n"
+            f"WER: {final_metrics['WER']:.4f}\n"
+            f"LA: {final_metrics['LA']:.4f}\n"
+            f"ATD: {final_metrics['ATD']:.4f}\n"
+        )
 
-# ---- PLOTS ----
-st.subheader("Metrics Visualization")
-fig, ax = plt.subplots()
-ax.plot(df['BLEU'], label="BLEU")
-ax.plot(df['WER'], label="WER")
-ax.plot(df['LA'], label="Local Agreement")
-ax.plot(df['ATD'], label="Token Delay")
-ax.set_xlabel("Sentence Index")
-ax.set_ylabel("Score")
-ax.legend()
-st.pyplot(fig)
-
-# ---- REPORT GENERATION ----
-st.subheader("Generate Detailed PDF Report")
-
-def generate_pdf(dataframe, filename="translation_report.pdf"):
-    styles = getSampleStyleSheet()
-    doc = SimpleDocTemplate(filename)
-    content = []
-    content.append(Paragraph("Japanese → English Translation Report", styles["Title"]))
-    content.append(Spacer(1, 12))
-    for _, row in dataframe.iterrows():
-        content.append(Paragraph(f"JP: {row['sentence']}", styles["Normal"]))
-        content.append(Paragraph(f"EN Predicted: {row['predicted_translation']}", styles["Normal"]))
-        if 'reference' in dataframe.columns:
-            content.append(Paragraph(f"EN Reference: {row['reference']}", styles["Normal"]))
-        content.append(Paragraph(f"BLEU: {row['BLEU']}, WER: {row['WER']}, LA: {row['LA']}, ATD: {row['ATD']}", styles["Normal"]))
-        content.append(Spacer(1, 12))
-    doc.build(content)
-    return filename
-
-if st.button("Generate PDF Report"):
-    pdf_path = generate_pdf(df)
-    with open(pdf_path, "rb") as f:
-        st.download_button("Download PDF", f, file_name="translation_report.pdf")
-
+        report_pdf_path = "translation_report.pdf"
+        pdf.output(report_pdf_path)
+        with open(report_pdf_path, "rb") as f:
+            st.download_button("⬇️ Download Report", f, file_name="translation_report.pdf", mime="application/pdf")
